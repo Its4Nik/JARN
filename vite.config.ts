@@ -21,7 +21,7 @@ export default defineConfig({
       },
       routes(defineRoutes) {
         return defineRoutes((route) => {
-          route("apng-converter", "routes/pages/apng-converter.tsx");
+          route("apng-converter", "routes/pages/apng-converter/apng-converter.tsx");
         });
       },
     }),
