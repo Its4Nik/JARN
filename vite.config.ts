@@ -1,4 +1,5 @@
 import { vitePlugin as remix } from "@remix-run/dev";
+import { defineRoutes } from "@remix-run/dev/dist/config/routes";
 import { defineConfig } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
@@ -17,6 +18,11 @@ export default defineConfig({
         v3_throwAbortReason: true,
         v3_singleFetch: true,
         v3_lazyRouteDiscovery: true,
+      },
+      routes(defineRoutes) {
+        return defineRoutes((route) => {
+          route("apng-converter", "routes/pages/apng-converter.tsx");
+        });
       },
     }),
     tsconfigPaths(),
