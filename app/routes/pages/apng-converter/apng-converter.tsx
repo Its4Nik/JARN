@@ -1,8 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { createFFmpeg, fetchFile } from "@ffmpeg/ffmpeg";
 import UPNG from "upng-js";
 
-const ffmpeg = createFFmpeg({ log: true });
+const ffmpeg = createFFmpeg({
+    log: true,
+    corePath: "https://unpkg.com/@ffmpeg/core@0.10.0/dist/ffmpeg-core.js"
+});
 
 export default function ApngConverter() {
     const [file, setFile] = useState<File | null>(null);
@@ -10,79 +13,151 @@ export default function ApngConverter() {
     const [apngUrl, setApngUrl] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [ffmpegLoaded, setFFmpegLoaded] = useState(false);
+    const isMounted = useRef(true);
 
     useEffect(() => {
+        isMounted.current = true;
+
         const loadFFmpeg = async () => {
-            if (!ffmpeg.isLoaded()) {
-                await ffmpeg.load();
+            try {
+                if (!ffmpeg.isLoaded()) {
+                    await ffmpeg.load();
+                    if (isMounted.current) setFFmpegLoaded(true);
+                }
+            } catch (err) {
+                console.error("FFmpeg loading error:", err);
+                if (isMounted.current) {
+                    setError("FFmpeg failed to load. Please try in a modern browser like Chrome or Edge.");
+                }
             }
         };
+
         loadFFmpeg();
+
+        return () => {
+            isMounted.current = false;
+            if (previewUrl) URL.revokeObjectURL(previewUrl);
+            if (apngUrl) URL.revokeObjectURL(apngUrl);
+        };
     }, []);
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const uploaded = e.target.files?.[0];
         if (!uploaded) return;
 
+        // Clean up previous state
+        setFile(null);
+        setError(null);
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        if (apngUrl) URL.revokeObjectURL(apngUrl);
+
+        const validTypes = [
+            "image/gif",
+            "video/mp4",
+            "video/webm",
+            "video/quicktime"
+        ];
+
+        if (!validTypes.includes(uploaded.type)) {
+            setError("Unsupported file type. Please upload GIF, MP4, or WebM.");
+            return;
+        }
+
         setFile(uploaded);
         setPreviewUrl(URL.createObjectURL(uploaded));
         setApngUrl(null);
-        setError(null);
     };
 
     const handleConvert = async () => {
-        console.log("test", file, ffmpeg.isLoaded());
-        if (!file || !ffmpeg.isLoaded()) return;
+        if (!file || !ffmpegLoaded || loading) return;
 
         setLoading(true);
-        setApngUrl(null);
         setError(null);
+        if (apngUrl) {
+            URL.revokeObjectURL(apngUrl);
+            setApngUrl(null);
+        }
 
         try {
-            const fileName = "input" + file.name.substring(file.name.lastIndexOf("."));
-            ffmpeg.FS("writeFile", fileName, await fetchFile(file));
+            // Generate unique filenames
+            const inputExt = file.name.substring(file.name.lastIndexOf("."));
+            const inputName = `input_${Date.now()}${inputExt}`;
+            const outputPattern = `frame_${Date.now()}_%03d.png`;
 
-            await ffmpeg.run("-i", fileName, "-vf", "fps=10,scale=320:-1", "frame_%03d.png");
+            // Write input file to FFmpeg FS
+            ffmpeg.FS("writeFile", inputName, await fetchFile(file));
 
-            const frameFiles = ffmpeg
-                .FS("readdir", "/")
-                .filter((f) => f.startsWith("frame_") && f.endsWith(".png"))
-                .sort();
+            // Run FFmpeg command
+            await ffmpeg.run(
+                "-i", inputName,
+                "-vf", "fps=10,scale=320:-1:flags=lanczos",
+                "-compression_level", "0",
+                outputPattern
+            );
 
-            const images: Uint8Array[] = [];
-            for (const name of frameFiles) {
-                const data = ffmpeg.FS("readFile", name);
-                images.push(data);
+            // Clean up input file
+            ffmpeg.FS("unlink", inputName);
+
+            // Read frames by iterating through possible indices
+            const frames: Uint8Array[] = [];
+            let frameIndex = 0;
+            const maxFrames = 1000; // Safety limit
+
+            while (frameIndex < maxFrames) {
+                try {
+                    const frameName = outputPattern.replace("%03d", frameIndex.toString().padStart(3, '0'));
+                    const frameData = ffmpeg.FS("readFile", frameName);
+                    frames.push(frameData);
+
+                    // Clean up frame file immediately
+                    ffmpeg.FS("unlink", frameName);
+                    frameIndex++;
+                } catch (error) {
+                    // Break when we can't find more frames
+                    break;
+                }
             }
 
-            const imageBuffers = images.map((i) => new Uint8Array(i));
-            const imgs = imageBuffers.map((buf) => new Uint8Array(buf.buffer));
+            if (frames.length === 0) {
+                throw new Error("No frames generated by FFmpeg");
+            }
 
-            const firstImage = new Image();
-            firstImage.src = URL.createObjectURL(new Blob([imgs[0]], { type: "image/png" }));
+            // Get dimensions from first frame
+            const firstFrame = frames[0];
+            const img = new Image();
+            const blobUrl = URL.createObjectURL(new Blob([firstFrame], { type: "image/png" }));
+            img.src = blobUrl;
 
-            firstImage.onload = () => {
-                try {
-                    const w = firstImage.width;
-                    const h = firstImage.height;
-                    const delay = 100;
+            await new Promise<void>((resolve, reject) => {
+                img.onload = () => resolve();
+                img.onerror = () => {
+                    URL.revokeObjectURL(blobUrl);
+                    reject(new Error("Failed to load first frame"));
+                };
+            });
 
-                    const apngBuffer = UPNG.encode(imgs, w, h, 0, new Array(imgs.length).fill(delay));
-                    const blob = new Blob([apngBuffer], { type: "image/apng" });
-                    const apngUrl = URL.createObjectURL(blob);
+            const { width, height } = img;
+            URL.revokeObjectURL(blobUrl);
 
-                    setApngUrl(apngUrl);
-                } catch (apngError) {
-                    console.error("APNG conversion error:", apngError);
-                    setError("Failed to encode APNG from frames.");
-                } finally {
-                    setLoading(false);
-                }
-            };
+            // Create APNG
+            const delays = new Array(frames.length).fill(100); // 100ms per frame (10fps)
+            const apngBuffer = UPNG.encode(frames, width, height, 0, delays);
+            const blob = new Blob([apngBuffer], { type: "image/apng" });
+            const newApngUrl = URL.createObjectURL(blob);
+
+            if (isMounted.current) {
+                setApngUrl(newApngUrl);
+            } else {
+                URL.revokeObjectURL(newApngUrl);
+            }
         } catch (err) {
             console.error("Conversion error:", err);
-            setError("Conversion failed. Please try again.");
-            setLoading(false);
+            if (isMounted.current) {
+                setError(err instanceof Error ? err.message : "Conversion failed");
+            }
+        } finally {
+            if (isMounted.current) setLoading(false);
         }
     };
 
@@ -90,48 +165,106 @@ export default function ApngConverter() {
         <div className="p-4 space-y-4 max-w-xl mx-auto">
             <h1 className="text-2xl font-bold">APNG Converter</h1>
 
+            {!ffmpegLoaded && !error && (
+                <div className="p-3 bg-blue-100 text-blue-700 rounded-md">
+                    Loading FFmpeg engine...
+                </div>
+            )}
+
             <input
                 type="file"
-                accept=".gif,.mp4,.webm"
+                accept=".gif,.mp4,.webm,.mov"
                 onChange={handleFileChange}
+                className="block w-full text-sm text-gray-500
+                  file:mr-4 file:py-2 file:px-4
+                  file:rounded file:border-0
+                  file:text-sm file:font-semibold
+                  file:bg-blue-50 file:text-blue-700
+                  hover:file:bg-blue-100"
+                disabled={!ffmpegLoaded}
             />
 
-            {previewUrl && (
-                <div>
-                    <h2 className="text-lg font-semibold">Preview:</h2>
-                    {file?.type.startsWith("video") ? (
-                        <video src={previewUrl} controls className="w-full" />
+            {error && (
+                <div className="p-3 bg-red-100 text-red-700 rounded-md">
+                    {error.includes("SharedArrayBuffer") ? (
+                        <div>
+                            <p className="font-bold">Browser Compatibility Issue</p>
+                            <p>Your browser requires special configuration to use this feature:</p>
+                            <ol className="list-decimal pl-5 mt-2 space-y-1">
+                                <li>Try using Chrome or Edge</li>
+                                <li>Enable cross-origin isolation by visiting this page via HTTPS</li>
+                                <li>Add these headers to your server response:
+                                    <pre className="bg-gray-800 text-gray-100 p-2 rounded mt-2 text-xs">
+                                        {`Cross-Origin-Embedder-Policy: require-corp\nCross-Origin-Opener-Policy: same-origin`}
+                                    </pre>
+                                </li>
+                            </ol>
+                        </div>
                     ) : (
-                        <img src={previewUrl} alt="preview" className="w-full" />
+                        `Error: ${error}`
                     )}
                 </div>
             )}
 
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {previewUrl && (
+                    <div>
+                        <h2 className="text-lg font-semibold mb-2">Preview:</h2>
+                        <div className="border rounded-md overflow-hidden bg-gray-100 flex items-center justify-center min-h-[200px]">
+                            {file?.type.startsWith("video") ? (
+                                <video src={previewUrl} controls className="max-h-60 max-w-full" />
+                            ) : (
+                                <img
+                                    src={previewUrl}
+                                    alt="preview"
+                                    className="max-h-60 max-w-full object-contain"
+                                />
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {apngUrl && (
+                    <div>
+                        <h2 className="text-lg font-semibold mb-2">Result:</h2>
+                        <div className="border rounded-md overflow-hidden bg-gray-100 flex items-center justify-center min-h-[200px]">
+                            <img
+                                src={apngUrl}
+                                alt="APNG result"
+                                className="max-h-60 max-w-full object-contain"
+                            />
+                        </div>
+                        <a
+                            href={apngUrl}
+                            download="converted.apng"
+                            className="mt-2 inline-block w-full text-center bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded transition-colors"
+                        >
+                            Download APNG
+                        </a>
+                    </div>
+                )}
+            </div>
+
             <button
                 onClick={handleConvert}
-                disabled={!file || loading}
-                className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50"
+                disabled={!file || loading || !ffmpegLoaded}
+                className={`w-full py-2 px-4 rounded transition-colors ${!file || loading || !ffmpegLoaded
+                    ? "bg-gray-400 cursor-not-allowed"
+                    : "bg-blue-600 hover:bg-blue-700 text-white"
+                    }`}
             >
-                {loading ? "Converting..." : "Convert to APNG"}
+                {loading ? (
+                    <span className="flex items-center justify-center">
+                        <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        Processing...
+                    </span>
+                ) : (
+                    "Convert to APNG"
+                )}
             </button>
-
-            {error && (
-                <div className="text-red-600 font-medium">{error}</div>
-            )}
-
-            {apngUrl && (
-                <div>
-                    <h2 className="text-lg font-semibold">Result:</h2>
-                    <img src={apngUrl} alt="APNG result" className="w-full" />
-                    <a
-                        href={apngUrl}
-                        download="converted.apng"
-                        className="mt-2 inline-block bg-green-600 text-white px-4 py-2 rounded"
-                    >
-                        Download APNG
-                    </a>
-                </div>
-            )}
         </div>
     );
 }

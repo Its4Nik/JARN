@@ -11,7 +11,7 @@
     "typecheck": "tsc"
   },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.11.6",
+    "@ffmpeg/ffmpeg": "^0.10.0",
     "@remix-run/node": "^2.15.3",
     "@remix-run/react": "^2.15.3",
     "@remix-run/serve": "^2.15.3",
